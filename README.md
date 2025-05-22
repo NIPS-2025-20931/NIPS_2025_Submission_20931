@@ -53,7 +53,7 @@ The directory structure of new project looks like this:
 │   └── smoke
 │       └──conf                        <-Hydra configs
 │
-├── environment.yml          <- File for installing conda environment
-├── smoke_example             <- FLUID example for smoke data
+├── environment.yml         <- File for installing conda environment
+├── smoke_example           <- FLUID example for smoke data
 └── README.md
 ```
