@@ -1,0 +1,18 @@
+defaults:
+  - common_train
+  - _self_
+
+encoder: GCN
+dir_weights: ./${encoder}/weights/
+dir_outputs: ./${encoder}/outputs/
+start_epoch: 0
+epochs: 500
+
+# Encoder Parameters
+msg_passing_steps: 3
+latent_feats: 128
+latent_fuse: MaxPooling
+
+
+# Network string
+network_str: ${latent_fuse}_${msg_passing_steps}

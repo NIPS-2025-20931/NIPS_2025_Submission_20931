@@ -1,0 +1,12 @@
+defaults:
+  - common_train
+  - _self_
+
+encoder: RIGNO
+dir_weights: ./${encoder}/weights/
+dir_outputs: ./${encoder}/outputs/
+start_epoch: 0
+epochs: 500
+latent_feats: 128
+
+network_str: RIGNO_${input_sampling_rate}

@@ -1,0 +1,12 @@
+defaults:
+  - common_test
+  - _self_
+
+encoder: FLUID
+dir_weights: ./${encoder}/weights/
+dir_outputs: ./${encoder}/outputs/
+start_epoch: 500
+epochs: 500
+num_modes: 16
+
+network_str: FLUID_${input_sampling_rate}

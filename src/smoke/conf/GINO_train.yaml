@@ -1,0 +1,16 @@
+defaults:
+  - common_train
+  - _self_
+
+encoder: GINO
+dir_weights: ./${encoder}/weights/
+dir_outputs: ./${encoder}/outputs/
+start_epoch: 0
+epochs: 500
+batch_size: 4
+
+# Encoder Parameters
+gno_transform_type: nonlinear
+
+# Network string
+network_str: ${gno_transform_type}

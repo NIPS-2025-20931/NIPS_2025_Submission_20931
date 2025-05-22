@@ -1,0 +1,26 @@
+defaults:
+  - _self_
+  - common_train
+
+encoder: MGN
+dir_weights: ./${encoder}/weights/
+dir_outputs: ./${encoder}/outputs/
+start_epoch: 0
+epochs: 500
+
+# Encoder Parameters
+enc_layers: 3
+enc_last_act: false
+enc_bias: true
+proc_layers: 1
+proc_last_act: false
+proc_bias: true
+msg_passing_steps: 3
+dec_layers: 3
+dec_last_act: false
+dec_bias: true
+latent_feats: 128
+latent_fuse: MaxPooling
+
+# Network string
+network_str: ${latent_fuse}_${enc_layers}_${proc_layers}_${msg_passing_steps}_${dec_layers}

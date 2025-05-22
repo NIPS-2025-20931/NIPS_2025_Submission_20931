@@ -1,0 +1,15 @@
+# General configuration
+seed: 0
+dataset: shallow_water
+root: ../../data/${dataset}/training_data/
+lr: 0.0001
+batch_size: 8
+check_every: 50
+loss: MSE
+latent_feats: 128
+
+# Decoder Parameters
+pos_feats: 120
+g_feats: 128
+hidden_layers: 4
+hidden_features: 128

@@ -1,0 +1,12 @@
+defaults:
+  - common_train
+  - _self_
+
+encoder: FNO_DSE
+dir_weights: ./${encoder}/weights/
+dir_outputs: ./${encoder}/outputs/
+start_epoch: 0
+epochs: 500
+num_modes: 16
+
+network_str: FNO_DSE_${input_sampling_rate}

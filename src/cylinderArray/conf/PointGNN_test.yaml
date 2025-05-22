@@ -1,0 +1,17 @@
+defaults:
+  - _self_
+  - common_test
+
+encoder: PointGNN
+dir_weights: ./${encoder}/weights/
+dir_outputs: ./${encoder}/outputs/
+start_epoch: 500
+epochs: 500
+
+# Encoder Parameters
+latent_feats: 128
+graph_net_layers: 3
+enc_last_act: true
+
+# Network string
+network_str: ${input_sampling_rate}_${graph_net_layers}

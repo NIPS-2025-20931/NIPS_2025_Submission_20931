@@ -1,0 +1,16 @@
+# General configuration
+seed: 0
+dataset: cylinderArray
+root: ../../data/${dataset}/testing_data/
+lr: 0.0001
+batch_size: 32
+check_every: 50
+loss: MSE
+input_sampling_rate: 1.0
+latent_feats: 128
+
+# Decoder Parameters
+pos_feats: 120
+g_feats: 128
+hidden_layers: 4
+hidden_features: 128

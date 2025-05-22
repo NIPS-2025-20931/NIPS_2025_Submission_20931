@@ -1,0 +1,18 @@
+defaults:
+  - _self_
+  - common_test
+
+encoder: PT
+dir_weights: ./${encoder}/weights/
+dir_outputs: ./${encoder}/outputs/
+start_epoch: 500
+epochs: 500
+
+# Encoder Parameters
+enc_layers: 3
+knn_neighbors: 16
+transformer_dim: 256
+latent_feats: 128
+
+# Network string
+network_str: ${enc_layers}_${knn_neighbors}_${transformer_dim}

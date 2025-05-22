@@ -1,0 +1,13 @@
+defaults:
+  - common_train
+  - _self_
+
+encoder: FLUID
+dir_weights: ./${encoder}/weights/
+dir_outputs: ./${encoder}/outputs/
+start_epoch: 0
+epochs: 500
+num_modes: 12
+batch_size: 8
+
+network_str: FLUID

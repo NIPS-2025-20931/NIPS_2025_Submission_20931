@@ -1,0 +1,528 @@
+from utils import *
+from DeepTypedGraphnet import *
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.spatial import cKDTree
+from scipy.spatial import Delaunay
+from torch_scatter import scatter_mean
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, Optional, Callable
+from functools import partial
+
+
+
+class Encoder(nn.Module):
+    # Encode point cloud to graph
+    def __init__(self, input_dim_edge, input_dim_node, hidden_dim):
+        super().__init__()
+        edge_latent_size=hidden_dim
+        node_latent_size=hidden_dim
+        node_output_size=hidden_dim
+        self.activation = lambda x: x * torch.sigmoid(x)
+        self.embed_edge_fn =  FeedForwardBlock(layer_sizes=[input_dim_edge, edge_latent_size, edge_latent_size], activation=self.activation, use_layer_norm=True)
+        self.embed_node_fn =  FeedForwardBlock(layer_sizes=[input_dim_node, node_latent_size, node_latent_size], activation=self.activation, use_layer_norm=True)
+        cur_process_edge_fn = FeedForwardBlock(
+                            layer_sizes=[edge_latent_size + node_latent_size + node_latent_size, edge_latent_size, edge_latent_size], 
+                            activation=self.activation, 
+                            use_layer_norm=True)
+        cur_process_node_fn = FeedForwardBlock(
+                            layer_sizes=[node_latent_size + edge_latent_size, node_latent_size, node_latent_size], 
+                            activation=self.activation, 
+                            use_layer_norm=True)
+        self.process_network = GraphNetwork(cur_process_edge_fn, cur_process_node_fn, mode='encode')
+        self.node_output_fn =  FeedForwardBlock(layer_sizes=[node_latent_size, node_latent_size, node_output_size], activation=self.activation, use_layer_norm=False)
+
+    def forward(self, edge_idx, edge_features, node_features):
+        edge_features = self.embed_edge_fn(edge_features)
+        node_features = self.embed_node_fn(node_features)
+        edge_latents, node_latents = self.process_network(edge_idx, edge_features, node_features)
+        node_latents += node_features[..., :node_latents.shape[-2], :]
+        node_latents = self.node_output_fn(node_latents)
+        return edge_latents, node_latents, node_features
+    
+
+class Processor(nn.Module):
+    def __init__(self, input_dim_edge, input_dim_node, hidden_dim):
+        super().__init__()
+        edge_latent_size=hidden_dim
+        node_latent_size=hidden_dim
+        node_output_size=hidden_dim
+        self.message_passing_steps = 1
+        self.activation = lambda x: x * torch.sigmoid(x)
+        self.embed_edge_fn =  FeedForwardBlock(layer_sizes=[input_dim_edge, edge_latent_size, edge_latent_size], activation=self.activation, use_layer_norm=True)
+        # Message Passing Processors
+        self.process_networks = nn.ModuleList()
+        for i in range(self.message_passing_steps):
+            cur_process_edge_fn = FeedForwardBlock(
+                            layer_sizes=[edge_latent_size + node_latent_size + node_latent_size, edge_latent_size, edge_latent_size], 
+                            activation=self.activation, 
+                            use_layer_norm=True)
+            cur_process_node_fn = FeedForwardBlock(
+                            layer_sizes=[node_latent_size + edge_latent_size, node_latent_size, node_latent_size], 
+                            activation=self.activation, 
+                            use_layer_norm=True)
+            self.process_networks.append(GraphNetwork(cur_process_edge_fn, cur_process_node_fn, mode='process'))
+
+        self.node_output_fn =  FeedForwardBlock(layer_sizes=[node_latent_size, node_latent_size, node_output_size], activation=self.activation, use_layer_norm=False)
+
+
+    def forward(self, edge_idx, edge_features, node_features):
+        edge_features = self.embed_edge_fn(edge_features)
+        for process_network in self.process_networks:
+            new_edge_features, new_node_features = process_network(edge_idx, edge_features, node_features)
+            edge_features += new_edge_features
+            node_features += new_node_features
+        node_features = self.node_output_fn(node_features)
+        return edge_features, node_features
+
+class Decoder(nn.Module):
+    def __init__(self, input_dim_edge, input_dim_node, hidden_dim, output_dim_node):
+        super().__init__()
+        edge_latent_size=hidden_dim
+        node_latent_size=hidden_dim
+        self.activation = lambda x: x * torch.sigmoid(x)
+        self.embed_edge_fn =  FeedForwardBlock(layer_sizes=[input_dim_edge, edge_latent_size, edge_latent_size], activation=self.activation, use_layer_norm=True)
+        self.process_edge_fn = FeedForwardBlock(
+                            layer_sizes=[edge_latent_size + node_latent_size + node_latent_size, edge_latent_size, edge_latent_size], 
+                            # layer_sizes=[edge_latent_size + node_latent_size, edge_latent_size, edge_latent_size], 
+                            activation=self.activation, 
+                            use_layer_norm=True)
+        self.process_node_fn = FeedForwardBlock(
+                            layer_sizes=[edge_latent_size + node_latent_size, node_latent_size, node_latent_size], 
+                            # layer_sizes=[edge_latent_size, node_latent_size, node_latent_size], 
+                            activation=self.activation, 
+                            use_layer_norm=True)
+        self.node_output_fn = FeedForwardBlock(layer_sizes=[node_latent_size, node_latent_size, output_dim_node], activation=torch.sigmoid, use_layer_norm=False)
+
+    def _update_edges(self, edge_idx, edge_features, node_latents, node_features):
+        """Updates edges using their corresponding functions."""
+        senders, receivers = edge_idx[...,0], edge_idx[...,1]
+        if len(node_latents.shape) == 2:
+            sender_features = node_latents[senders]
+            receiver_features = node_features[receivers]
+        elif len(node_latents.shape) == 3:
+            sender_features = node_latents[:, senders, :]
+            receiver_features = node_features[:, receivers, :]
+        else:
+            print('Unexpected node_latents dimension {0}'.format(len(node_latents.shape)))
+            print('Unexpected node_feature dimension {0}'.format(len(node_features.shape)))
+            exit()
+        edge_features = self.process_edge_fn(sender_features, receiver_features, edge_features)
+        # edge_features = self.process_edge_fn(sender_features, edge_features)
+        return edge_features
+    
+    def _update_nodes(self, edge_idx, edge_features, node_features):
+        """Updates nodes using aggregated edge messages."""
+        receivers = edge_idx[...,1]
+        mean_edges = scatter_mean(edge_features, receivers, dim=-2, dim_size=node_features.shape[1])
+        new_node_features = self.process_node_fn(node_features, mean_edges)
+        # new_node_features = self.process_node_fn(mean_edges)
+        return new_node_features
+
+    def forward(self, edge_idx, edge_features, node_latents, node_features):
+        edge_features = self.embed_edge_fn(edge_features)
+        new_edge_features = self._update_edges(edge_idx, edge_features, node_latents, node_features)
+        new_node_features = self._update_nodes(edge_idx, new_edge_features, node_features)
+        output_features = self.node_output_fn(new_node_features)
+        return edge_features, output_features
+
+
+# class for fully nonequispaced 2d points
+class VFT:
+    def __init__(self, x_positions, y_positions, modes):
+        # it is important that positions are scaled between 0 and 2*pi
+        x_positions -= torch.min(x_positions)
+        self.x_positions = x_positions * 6.28 / (torch.max(x_positions))
+        y_positions -= torch.min(y_positions)
+        self.y_positions = y_positions * 6.28 / (torch.max(y_positions))
+        self.number_points = x_positions.shape[1]
+        self.batch_size = x_positions.shape[0]
+        self.modes = modes
+
+        self.X_ = torch.cat((torch.arange(modes), torch.arange(start=-(modes), end=0)), 0).repeat(self.batch_size, 1)[:,:,None].float().cuda()
+        self.Y_ = torch.cat((torch.arange(modes), torch.arange(start=-(modes-1), end=0)), 0).repeat(self.batch_size, 1)[:,:,None].float().cuda()
+
+        self.V_fwd, self.V_inv = self.make_matrix()
+
+    def make_matrix(self):
+        m = (self.modes*2)*(self.modes*2-1)
+        X_mat = torch.bmm(self.X_, self.x_positions[:,None,:]).repeat(1, (self.modes*2-1), 1)
+        Y_mat = (torch.bmm(self.Y_, self.y_positions[:,None,:]).repeat(1, 1, self.modes*2).reshape(self.batch_size,m,self.number_points))
+        forward_mat = torch.exp(-1j* (X_mat+Y_mat))
+        inverse_mat = torch.conj(forward_mat.clone()).permute(0,2,1)
+        return forward_mat, inverse_mat
+
+    def forward(self, data):
+        data_fwd = torch.bmm(self.V_fwd, data)
+        return data_fwd
+
+    def inverse(self, data):
+        data_inv = torch.bmm(self.V_inv, data)
+        return data_inv
+    
+
+class VFT3D:
+    def __init__(self, x_positions, y_positions, z_positions, modes):
+        # it is important that positions are scaled between 0 and 2*pi
+        x_positions -= torch.min(x_positions)
+        self.x_positions = x_positions * 6.28 / (torch.max(x_positions))
+        y_positions -= torch.min(y_positions)
+        self.y_positions = y_positions * 6.28 / (torch.max(y_positions))
+        z_positions -= torch.min(z_positions)
+        self.z_positions = z_positions * 6.28 / (torch.max(z_positions))
+        self.number_points = x_positions.shape[1]
+        self.batch_size = x_positions.shape[0]
+        self.modes = modes
+
+        self.X_ = torch.cat((torch.arange(modes), torch.arange(start=-(modes), end=0)), 0).repeat(self.batch_size, 1)[:,:,None].float().cuda()
+        self.Y_ = torch.cat((torch.arange(modes), torch.arange(start=-(modes), end=0)), 0).repeat(self.batch_size, 1)[:,:,None].float().cuda()
+        self.Z_ = torch.cat((torch.arange(modes), torch.arange(start=-(modes), end=0)), 0).repeat(self.batch_size, 1)[:,:,None].float().cuda()
+
+        self.V_fwd, self.V_inv = self.make_matrix()
+
+    def make_matrix(self):
+        m = (self.modes*2)*(self.modes*2)*(self.modes*2)
+        X_mat = torch.bmm(self.X_, self.x_positions[:,None,:]).repeat(1, (self.modes*2), 1)
+        Y_mat = torch.bmm(self.Y_, self.y_positions[:,None,:]).repeat(1, 1, self.modes*2).reshape(self.batch_size,(self.modes*2)*(self.modes*2),self.number_points)
+        intermediate = (X_mat+Y_mat).repeat(1, self.modes*2, 1)
+        Z_mat = (torch.bmm(self.Z_, self.z_positions[:,None,:]).repeat(1, 1, self.modes*2*self.modes*2).reshape(self.batch_size,m,self.number_points))
+        forward_mat = torch.exp(-1j* (intermediate+Z_mat))
+        inverse_mat = torch.conj(forward_mat.clone()).permute(0,2,1)
+        return forward_mat, inverse_mat
+
+    def forward(self, data):
+        data_fwd = torch.bmm(self.V_fwd, data)
+        return data_fwd
+
+    def inverse(self, data):
+        data_inv = torch.bmm(self.V_inv, data)
+        return data_inv
+    
+class SpectralConv2d_dse (nn.Module):
+    def __init__(self, in_channels, out_channels, modes1, modes2):
+        super().__init__()
+        """
+        2D Fourier layer. It does FFT, linear transform, and Inverse FFT.    
+        """
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1 = modes1 #Number of Fourier modes to multiply, at most floor(N/2) + 1
+        self.modes2 = modes2
+
+        self.scale = (1 / (in_channels * out_channels))
+        self.weights1 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
+        self.weights2 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
+
+    # Complex multiplication and complex batched multiplications
+    def compl_mul1d(self, input, weights):
+        # (batch, in_channel, x ), (in_channel, out_channel, x) -> (batch, out_channel, x)
+        return torch.einsum("bix,iox->box", input, weights)
+
+    # Complex multiplication
+    def compl_mul2d(self, input, weights):
+        # (batch, in_channel, x,y ), (in_channel, out_channel, x,y) -> (batch, out_channel, x,y)
+        return torch.einsum("bixy,ioxy->boxy", input, weights)
+
+    def forward(self, x, transformer):
+        batchsize = x.shape[0]
+
+        x = x.permute(0, 2, 1)
+        
+        #Compute Fourier coeffcients up to factor of e^(- something constant)
+        x_ft = transformer.forward(x.cfloat()) #[4, 20, 32, 16]
+        x_ft = x_ft.permute(0, 2, 1)
+        # out_ft = self.compl_mul1d(x_ft, self.weights3)
+        x_ft = torch.reshape(x_ft, (batchsize, self.out_channels, 2*self.modes1, 2*self.modes1-1))
+
+        # # Multiply relevant Fourier modes
+        out_ft = torch.zeros(batchsize, self.out_channels, 2*self.modes1, self.modes1, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :self.modes1, :self.modes1] = self.compl_mul2d(x_ft[:, :, :self.modes1, :self.modes1], self.weights1)
+        out_ft[:, :, -self.modes1:, :self.modes1] = self.compl_mul2d(x_ft[:, :, -self.modes1:, :self.modes1], self.weights2)
+
+        # #Return to physical space
+        x_ft = torch.reshape(out_ft, (batchsize, self.out_channels, 2*self.modes1**2))
+        x_ft2 = x_ft[..., 2*self.modes1:].flip(-1, -2).conj()
+        x_ft = torch.cat([x_ft, x_ft2], dim=-1)
+
+        x_ft = x_ft.permute(0, 2, 1)
+        x = transformer.inverse(x_ft) # x [4, 20, 512, 512]
+        x = x.permute(0, 2, 1)
+        x = x / x.size(-1) * 2
+
+        return x.real
+
+
+class SpectralConv3d_dse(nn.Module):
+    def __init__(self, in_channels, out_channels, modes1, modes2, modes3):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1 = modes1 #Number of Fourier modes to multiply, at most floor(N/2) + 1
+        self.modes2 = modes2
+        self.modes3 = modes3
+
+        self.scale = (1 / (in_channels * out_channels))
+        self.weights1 = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, self.modes3, dtype=torch.cfloat))
+        self.weights2 = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, self.modes3, dtype=torch.cfloat))
+        self.weights3 = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, self.modes3, dtype=torch.cfloat))
+        self.weights4 = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, self.modes3, dtype=torch.cfloat))
+
+    def compl_mul3d(self, a, b):
+        return torch.einsum("bixyz,ioxyz->boxyz", a, b)
+
+    def forward(self, x, transformer):
+        batchsize = x.shape[0]
+        
+        x = x.permute(0, 2, 1)
+        
+        #Compute Fourier coeffcients up to factor of e^(- something constant)
+        x_ft = transformer.forward(x.cfloat()) #[4, 20, 32, 16]
+        x_ft = x_ft.permute(0, 2, 1)
+        # out_ft = self.compl_mul1d(x_ft, self.weights3)
+        x_ft = torch.reshape(x_ft, (batchsize, self.out_channels, 2*self.modes1, 2*self.modes2, 2*self.modes3))
+
+        # Multiply relevant Fourier modes
+        out_ft = torch.zeros(batchsize, self.in_channels, x_ft.size(-3), x_ft.size(-2), x_ft.size(-1)//2, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :self.modes1, :self.modes2, :self.modes3] = self.compl_mul3d(x_ft[:, :, :self.modes1, :self.modes2, :self.modes3], self.weights1)
+        out_ft[:, :, -self.modes1:, :self.modes2, :self.modes3] = self.compl_mul3d(x_ft[:, :, -self.modes1:, :self.modes2, :self.modes3], self.weights2)
+        out_ft[:, :, :self.modes1, -self.modes2:, :self.modes3] = self.compl_mul3d(x_ft[:, :, :self.modes1, -self.modes2:, :self.modes3], self.weights3)
+        out_ft[:, :, -self.modes1:, -self.modes2:, :self.modes3] = self.compl_mul3d(x_ft[:, :, -self.modes1:, -self.modes2:, :self.modes3], self.weights4)
+
+        # #Return to physical space
+        x_ft = torch.reshape(out_ft, (batchsize, self.out_channels, 2*self.modes1 * 2*self.modes2 * self.modes3))
+        x_ft2 = x_ft.flip(-1, -2).conj()
+        x_ft = torch.cat([x_ft, x_ft2], dim=-1)
+
+        x_ft = x_ft.permute(0, 2, 1)
+        x = transformer.inverse(x_ft) # x [4, 20, 512, 512]
+        x = x.permute(0, 2, 1)
+        x = x / x.size(-1) * 2
+
+        return x.real
+
+
+class FLUID(nn.Module):
+    def __init__(self, input_dim_edge, input_dim_node, num_modes, hidden_dim, output_dim_node):
+        super().__init__()
+        self.encoder = Encoder(input_dim_edge, input_dim_node, hidden_dim)
+        self.conv0 = SpectralConv2d_dse(hidden_dim, hidden_dim, num_modes, num_modes)
+        self.conv1 = SpectralConv2d_dse(hidden_dim, hidden_dim, num_modes, num_modes)
+        self.conv2 = SpectralConv2d_dse(hidden_dim, hidden_dim, num_modes, num_modes)
+        self.conv3 = SpectralConv2d_dse(hidden_dim, hidden_dim, num_modes, num_modes)
+
+        self.processor0 = Processor(input_dim_edge, hidden_dim, hidden_dim)
+        self.processor1 = Processor(input_dim_edge, hidden_dim, hidden_dim)
+        self.processor2 = Processor(input_dim_edge, hidden_dim, hidden_dim)
+        self.processor3 = Processor(input_dim_edge, hidden_dim, hidden_dim)
+        self.decoder = Decoder(input_dim_edge, hidden_dim, hidden_dim, output_dim_node)
+
+    def forward(self, pc2g:Dict, g2g:Dict, transform, g2pc:Dict):
+        edge_idx, edge_features, node_features = pc2g['edge_idx'], pc2g['edge_features'], pc2g['node_features']
+        edge_latents, node_latents, node_features = self.encoder(edge_idx, edge_features, node_features)
+
+        edge_idx, edge_features = g2g['edge_idx'], g2g['edge_features']
+        x1 = self.conv0(node_latents.permute(0, 2, 1), transform).permute(0, 2, 1)
+        _, x2 = self.processor0(edge_idx, edge_features, node_latents)
+        node_latents = x1 + x2
+        node_latents = F.gelu(node_latents)
+
+        x1 = self.conv1(node_latents.permute(0, 2, 1), transform).permute(0, 2, 1)
+        _, x2 = self.processor1(edge_idx, edge_features, node_latents)
+        node_latents = x1 + x2
+        node_latents = F.gelu(node_latents)
+
+        x1 = self.conv2(node_latents.permute(0, 2, 1), transform).permute(0, 2, 1)
+        _, x2 = self.processor2(edge_idx, edge_features, node_latents)
+        node_latents = x1 + x2
+        node_latents = F.gelu(node_latents)
+
+        x1 = self.conv3(node_latents.permute(0, 2, 1), transform).permute(0, 2, 1)
+        _, x2 = self.processor3(edge_idx, edge_features, node_latents)
+        node_latents = x1 + x2
+
+        edge_idx, edge_features = g2pc['edge_idx'], g2pc['edge_features']
+        edge_latents, node_features = self.decoder(edge_idx, edge_features, node_latents, node_features)
+
+        return node_features
+    
+
+class FLUID_3D(nn.Module):
+    def __init__(self, input_dim_edge, input_dim_node, num_modes, hidden_dim, output_dim_node):
+        super().__init__()
+        self.encoder = Encoder(input_dim_edge, input_dim_node, hidden_dim)
+        self.conv0 = SpectralConv3d_dse(hidden_dim, hidden_dim, num_modes, num_modes, num_modes)
+        self.conv1 = SpectralConv3d_dse(hidden_dim, hidden_dim, num_modes, num_modes, num_modes)
+        self.conv2 = SpectralConv3d_dse(hidden_dim, hidden_dim, num_modes, num_modes, num_modes)
+        self.conv3 = SpectralConv3d_dse(hidden_dim, hidden_dim, num_modes, num_modes, num_modes)
+
+        self.processor0 = Processor(input_dim_edge, hidden_dim, hidden_dim)
+        self.processor1 = Processor(input_dim_edge, hidden_dim, hidden_dim)
+        self.processor2 = Processor(input_dim_edge, hidden_dim, hidden_dim)
+        self.processor3 = Processor(input_dim_edge, hidden_dim, hidden_dim)
+        self.decoder = Decoder(input_dim_edge, hidden_dim, hidden_dim, output_dim_node)
+
+    def forward(self, pc2g:Dict, g2g:Dict, transform, g2pc:Dict):
+        edge_idx, edge_features, node_features = pc2g['edge_idx'], pc2g['edge_features'], pc2g['node_features']
+        edge_latents, node_latents, node_features = self.encoder(edge_idx, edge_features, node_features)
+
+        edge_idx, edge_features = g2g['edge_idx'], g2g['edge_features']
+        x1 = self.conv0(node_latents.permute(0, 2, 1), transform).permute(0, 2, 1)
+        _, x2 = self.processor0(edge_idx, edge_features, node_latents)
+        node_latents = x1 + x2
+        node_latents = F.gelu(node_latents)
+
+        x1 = self.conv1(node_latents.permute(0, 2, 1), transform).permute(0, 2, 1)
+        _, x2 = self.processor1(edge_idx, edge_features, node_latents)
+        node_latents = x1 + x2
+        node_latents = F.gelu(node_latents)
+
+        x1 = self.conv2(node_latents.permute(0, 2, 1), transform).permute(0, 2, 1)
+        _, x2 = self.processor2(edge_idx, edge_features, node_latents)
+        node_latents = x1 + x2
+        node_latents = F.gelu(node_latents)
+
+        x1 = self.conv3(node_latents.permute(0, 2, 1), transform).permute(0, 2, 1)
+        _, x2 = self.processor3(edge_idx, edge_features, node_latents)
+        node_latents = x1 + x2
+
+        edge_idx, edge_features = g2pc['edge_idx'], g2pc['edge_features']
+        edge_latents, node_features = self.decoder(edge_idx, edge_features, node_latents, node_features)
+
+        return node_features
+    
+
+class FLUID_cylinder(nn.Module):
+    def __init__(self, input_dim_edge, input_dim_node, num_modes, hidden_dim, output_dim_node):
+        super().__init__()
+        self.encoder = Encoder(input_dim_edge, input_dim_node, hidden_dim)
+        self.conv0 = SpectralConv2d_dse(hidden_dim, hidden_dim, num_modes, num_modes)
+        self.conv1 = SpectralConv2d_dse(hidden_dim, hidden_dim, num_modes, num_modes)
+        self.conv2 = SpectralConv2d_dse(hidden_dim, hidden_dim, num_modes, num_modes)
+
+        self.processor0 = Processor(input_dim_edge, hidden_dim, hidden_dim)
+        self.processor1 = Processor(input_dim_edge, hidden_dim, hidden_dim)
+        self.processor2 = Processor(input_dim_edge, hidden_dim, hidden_dim)
+        self.decoder = Decoder(input_dim_edge, hidden_dim, hidden_dim, output_dim_node)
+
+    def forward(self, pc2g:Dict, g2g:Dict, transform, g2pc:Dict):
+        edge_idx, edge_features, node_features = pc2g['edge_idx'], pc2g['edge_features'], pc2g['node_features']
+        edge_latents, node_latents, node_features = self.encoder(edge_idx, edge_features, node_features)
+
+        edge_idx, edge_features = g2g['edge_idx'], g2g['edge_features']
+        x1 = self.conv0(node_latents.permute(0, 2, 1), transform).permute(0, 2, 1)
+        _, x2 = self.processor0(edge_idx, edge_features, node_latents)
+        node_latents = x1 + x2
+        node_latents = F.gelu(node_latents)
+
+        x1 = self.conv1(node_latents.permute(0, 2, 1), transform).permute(0, 2, 1)
+        _, x2 = self.processor1(edge_idx, edge_features, node_latents)
+        node_latents = x1 + x2
+        node_latents = F.gelu(node_latents)
+
+        x1 = self.conv2(node_latents.permute(0, 2, 1), transform).permute(0, 2, 1)
+        _, x2 = self.processor2(edge_idx, edge_features, node_latents)
+        node_latents = x1 + x2
+
+        edge_idx, edge_features = g2pc['edge_idx'], g2pc['edge_features']
+        edge_latents, node_features = self.decoder(edge_idx, edge_features, node_latents, node_features)
+
+        return node_features
+
+def PointCloudToGraph(points, nodes, radius):
+    tree = cKDTree(points)
+    edges = []
+    
+    for nodeidx in nodes:
+        idxs = tree.query_ball_point(points[nodeidx], radius)
+        edges += [[i, nodeidx] for i in idxs if i != nodeidx]
+    
+    return np.array(edges)
+
+def GraphToPointCloud(nodes, query_points, radius):
+    tree = cKDTree(nodes)
+    edges = []
+
+    nPoints = len(query_points)
+
+    for pointidx in range(nPoints):
+        idxs = tree.query_ball_point(query_points[pointidx], radius)
+        edges += [[i, pointidx] for i in idxs]
+    
+    return np.array(edges)
+
+
+def MultiResGraph(points, index, levels, pc2gfactor, g2gfactor, method):
+    """
+    Perform hierarchical sampling based on the given factor.
+    
+    Args:
+        points (np.ndarray): The input array of shape (N, d).
+        index (np.ndarray): The index array of shape (N,).
+        factor (float): The sampling factor.
+
+    Returns:
+        list of tuples: Each tuple contains (sampled_data, reordered_index) at each level.
+    """
+    N, d = points.shape
+    current_data = points
+    current_index = index
+    returned_data = np.copy(points)
+    returned_index = np.copy(index)
+    factor = pc2gfactor
+    current_level = 0
+    npts = []
+
+    while N * factor >= 10 and current_level < levels:
+        num_selected = int(N / factor)
+        if method == 'random':
+            selected_indices = np.random.choice(N, num_selected, replace=False)
+        else:
+            print('Method {0} is not defined'.format(method))
+            exit()
+        
+        # Selected points and non-selected points
+        selected_points = current_data[selected_indices]
+        non_selected_indices = np.setdiff1d(np.arange(N), selected_indices)
+        non_selected_points = current_data[non_selected_indices]
+
+        # Reorder to maintain (N, d) shape
+        reordered_data = np.vstack([selected_points, non_selected_points])
+        reordered_index = np.hstack([current_index[selected_indices], current_index[non_selected_indices]])
+
+        returned_data[:N] = reordered_data
+        returned_index[:N] = reordered_index
+
+        # Update for next iteration
+        current_data = selected_points  # Use only the selected points for next iteration
+        current_index = current_index[selected_indices]
+        N = num_selected  # Update N
+        factor = g2gfactor
+        current_level += 1
+        npts.append(num_selected)
+
+    return returned_data, returned_index, npts
+
+
+def GraphToGraphEdges(points, npts):
+    all_edges = None
+    for npt in npts:
+        tri = Delaunay(points=points[:npt])
+        indptr, cols = tri.vertex_neighbor_vertices
+        rows = np.repeat(np.arange(len(indptr) - 1), np.diff(indptr))
+        edges = np.stack([rows, cols], -1)
+        edges = np.concatenate([edges, np.flip(edges, axis=-1)], axis=0)
+        try:
+            all_edges = np.vstack((all_edges, edges))
+        except:
+            all_edges = edges
+
+    s = set()
+    for e in all_edges:
+        t = tuple(e)
+        s.add(t)
+    all_edges = np.array(list(s))
+    return all_edges

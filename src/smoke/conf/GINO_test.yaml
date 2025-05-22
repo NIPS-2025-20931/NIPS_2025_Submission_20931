@@ -1,0 +1,15 @@
+defaults:
+  - common_test
+  - _self_
+
+encoder: GINO
+dir_weights: ./${encoder}/weights/
+dir_outputs: ./${encoder}/outputs/
+start_epoch: 500
+epochs: 500
+
+# Encoder Parameters
+gno_transform_type: nonlinear
+
+# Network string
+network_str: ${gno_transform_type}

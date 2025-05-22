@@ -1,0 +1,11 @@
+defaults:
+  - common_test
+  - _self_
+  
+encoder: RIGNO
+dir_weights: ./${encoder}/weights/
+dir_outputs: ./${encoder}/outputs/
+start_epoch: 500
+epochs: 500
+
+network_str: RIGNO

@@ -1,0 +1,17 @@
+defaults:
+  - _self_
+  - common_train
+
+encoder: GAT
+dir_weights: ./${encoder}/weights/
+dir_outputs: ./${encoder}/outputs/
+start_epoch: 0
+epochs: 500
+
+# Encoder Parameters
+latent_feats: 128
+msg_passing_steps: 3
+latent_fuse: MaxPooling
+
+# Network string
+network_str: ${input_sampling_rate}_${latent_fuse}_${msg_passing_steps}
